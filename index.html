@@ -35,6 +35,8 @@
   /* ---------- Top bar ---------- */
   .topbar { position: fixed; top: 0; left: 0; right: 0; height: 60px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; z-index: 20; }
   .logo { font-weight: 800; font-size: 20px; letter-spacing: -.5px; opacity: .9; }
+  .status { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 10px; background: var(--chip); color: var(--text-dim); white-space: nowrap; }
+  .status.live { color: #7CFC9B; } .status.off { color: #ffb4a2; } .status:empty { display: none; }
   .topbar-right { display: flex; align-items: center; gap: 10px; }
   .search { display: flex; align-items: center; gap: 6px; background: var(--chip); border-radius: 18px; height: 36px; padding: 0 12px; width: 80px; transition: width .2s; }
   .search:focus-within { width: 220px; background: var(--chip-hover); }
@@ -349,7 +351,7 @@
 
 <!-- ===== Top bar ===== -->
 <header class="topbar">
-  <div class="logo">Jadlet</div>
+  <div style="display:flex;align-items:center;gap:10px"><div class="logo">Jadlet</div><span class="status" id="status"></span></div>
   <div class="topbar-right">
     <label class="search">
       <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -366,7 +368,7 @@
       <span class="sep"></span>
       <button class="icon-btn" id="moreBtn" title="더보기"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="8" cy="12" r=".6"/><circle cx="12" cy="12" r=".6"/><circle cx="16" cy="12" r=".6"/></svg></button>
     </div>
-    <div class="avatar">🐯</div>
+    <button class="avatar" id="avatarBtn" title="내 이름 설정">🐯</button>
   </div>
 </header>
 
@@ -454,17 +456,131 @@
 
 <script>
 /* =====================================================================
- *  Storage 레이어 — SDK 연결 시 이 클래스만 교체 (load / save 시그니처 유지)
+ *  Storage 레이어
+ *  - 공통 인터페이스: init(onRemoteChange) → 초기 상태 | null
+ *                    save(state) → true | 'quota' | 'disabled' | 'error'
+ *                    uploadFile(dataUrl, name, mime) → 저장 가능한 src
+ *  - FIREBASE_CONFIG 가 있으면 FirebaseStore(실시간 공유), 없거나 ?local=1 이면 LocalStore
  * ===================================================================== */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCUkHgdrmsP6-rzhW26j1S6IVhzP_bQ7XI",
+  authDomain: "hakmin-life.firebaseapp.com",
+  projectId: "hakmin-life",
+  storageBucket: "hakmin-life.firebasestorage.app",
+  messagingSenderId: "577095439891",
+  appId: "1:577095439891:web:60c6998c0734718d3891e6",
+};
+const FB_VER = '10.14.1';
+const BOARD_ID = (new URLSearchParams(location.search).get('b') || 'main').replace(/[^\w-]/g, '').slice(0, 40) || 'main';
+const INLINE_LIMIT = 900 * 1024;      // Firestore 문서 1MB 제한 → 인라인 첨부 상한
+const clean = (o) => JSON.parse(JSON.stringify(o));  // undefined 제거 (Firestore가 거부함)
+
+/* 이미지 축소: 긴 변 max px, JPEG 품질 q */
+function shrinkImage(dataUrl, max = 1280, q = 0.8) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => {
+      const r = Math.min(1, max / Math.max(im.width, im.height));
+      const c = document.createElement('canvas'); c.width = Math.round(im.width * r); c.height = Math.round(im.height * r);
+      c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+      res(c.toDataURL('image/jpeg', q));
+    };
+    im.onerror = rej; im.src = dataUrl;
+  });
+}
+
 class LocalStore {
-  constructor(key) { this.key = key; }
-  async load() { try { return JSON.parse(localStorage.getItem(this.key) || localStorage.getItem('padlet-clone-v1')) || null; } catch { return null; } }
+  constructor(key) { this.key = key; this.realtime = false; }
+  async init() { try { return JSON.parse(localStorage.getItem(this.key) || localStorage.getItem('padlet-clone-v1')) || null; } catch { return null; } }
+  remember() {}
   async save(state) {
     try { localStorage.setItem(this.key, JSON.stringify(state)); return true; }
     catch (e) { console.warn('저장 실패', e); return e.name === 'QuotaExceededError' ? 'quota' : 'disabled'; }
   }
+  async uploadFile(dataUrl) { return dataUrl; }
 }
-const store = new LocalStore('jadlet-v1');
+
+class FirebaseStore {
+  constructor(cfg, boardId) { this.cfg = cfg; this.boardId = boardId; this.realtime = true; this.lastMeta = null; this.lastPosts = new Map(); this.board = null; this.posts = []; }
+  async init(onChange) {
+    const base = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+    const [{ initializeApp }, fs] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-firestore.js')]);
+    this.fs = fs; this.app = initializeApp(this.cfg); this.db = fs.getFirestore(this.app);
+    this.boardRef = fs.doc(this.db, 'boards', this.boardId);
+    this.postsRef = fs.collection(this.boardRef, 'posts');
+    import(base + 'firebase-storage.js').then((st) => {
+      this.st = st; this.storage = st.getStorage(this.app);
+      this.storage.maxUploadRetryTime = 8000; this.storage.maxOperationRetryTime = 8000;   // 미설정 버킷이면 빨리 포기하고 인라인 폴백
+    }).catch(() => {});
+
+    return new Promise((resolve, reject) => {
+      let gotB = false, gotP = false, resolved = false;
+      const snapshot = () => this.board ? { ...this.board, posts: this.posts } : null;
+      const emit = () => {
+        if (!resolved) { if (gotB && gotP) { resolved = true; clearTimeout(timer); resolve(snapshot()); } }
+        else onChange(snapshot());
+      };
+      const fail = (e) => { console.error('Firestore', e); if (!resolved) { resolved = true; reject(e); } else toast('실시간 연결이 끊겼어요: ' + e.code); };
+      const timer = setTimeout(() => fail(Object.assign(new Error('timeout'), { code: '연결 시간 초과' })), 12000);
+      fs.onSnapshot(this.boardRef, (s) => { this.board = s.exists() ? s.data() : null; gotB = true; emit(); }, fail);
+      fs.onSnapshot(this.postsRef, (s) => { this.posts = s.docs.map((d) => d.data()); gotP = true; emit(); }, fail);
+    });
+  }
+  /* 서버에서 받은(또는 방금 저장한) 상태를 기억해 두고, save()에서는 바뀐 문서만 씀 */
+  remember(state) {
+    const { posts, ...meta } = state;
+    this.lastMeta = JSON.stringify(clean(meta));
+    this.lastPosts = new Map(posts.map((p) => [p.id, JSON.stringify(clean(p))]));
+  }
+  async save(state) {
+    const fs = this.fs, batch = fs.writeBatch(this.db);
+    const { posts, ...meta } = state;
+    const metaC = clean(meta), metaJ = JSON.stringify(metaC);
+    let n = 0;
+    if (metaJ !== this.lastMeta) { batch.set(this.boardRef, metaC); this.lastMeta = metaJ; n++; }
+    const seen = new Set();
+    for (const p of posts) {
+      const c = clean(p), j = JSON.stringify(c); seen.add(p.id);
+      if (this.lastPosts.get(p.id) !== j) { batch.set(fs.doc(this.postsRef, p.id), c); this.lastPosts.set(p.id, j); n++; }
+    }
+    for (const id of [...this.lastPosts.keys()]) if (!seen.has(id)) { batch.delete(fs.doc(this.postsRef, id)); this.lastPosts.delete(id); n++; }
+    if (!n) return true;
+    try { await batch.commit(); return true; }
+    catch (e) { console.error('save', e); toast('저장 실패: ' + (e.code === 'permission-denied' ? 'Firestore 규칙에서 쓰기를 허용해주세요' : e.message)); return 'error'; }
+  }
+  /* 첨부 업로드: Storage → (실패 시) 이미지 압축 인라인 → 크기 초과면 에러 */
+  async uploadFile(dataUrl, name = 'file', mime = '') {
+    if (!dataUrl.startsWith('data:')) return dataUrl;
+    if (this.storage) {
+      try {
+        const ref = this.st.ref(this.storage, `boards/${this.boardId}/${Date.now()}-${name.replace(/[^\w.-]/g, '_')}`);
+        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('storage-timeout')), 15000));
+        await Promise.race([this.st.uploadString(ref, dataUrl, 'data_url'), timeout]);
+        return await Promise.race([this.st.getDownloadURL(ref), timeout]);
+      } catch (e) { console.warn('Storage 업로드 실패 → 인라인 시도', e.code || e.message); this.storage = null; }
+    }
+    let src = dataUrl;
+    if (mime.startsWith('image/') || dataUrl.startsWith('data:image/')) {
+      for (const [max, q] of [[1280, 0.8], [960, 0.7], [640, 0.6]]) { if (src.length < INLINE_LIMIT) break; src = await shrinkImage(dataUrl, max, q); }
+    }
+    if (src.length > INLINE_LIMIT) throw new Error('파일이 커서 저장할 수 없어요 (Firebase Storage를 활성화하면 큰 파일도 가능)');
+    return src;
+  }
+}
+
+const USE_LOCAL = !FIREBASE_CONFIG || new URLSearchParams(location.search).has('local');
+let store = USE_LOCAL ? new LocalStore('jadlet-v1') : new FirebaseStore(FIREBASE_CONFIG, BOARD_ID);
+
+/* 내 브라우저에만 저장되는 개인 정보: 이름, 내가 누른 반응/투표 */
+const me = (() => { try { return JSON.parse(localStorage.getItem('jadlet-me')) || {}; } catch { return {}; } })();
+me.flags ||= {};
+const saveMe = () => { try { localStorage.setItem('jadlet-me', JSON.stringify(me)); } catch {} };
+const myFlag = (id) => (me.flags[id] ||= {});
+function ensureName() {
+  if (me.name) return me.name;
+  const v = (prompt('게시물에 표시할 이름을 입력하세요 (비우면 익명)') || '').trim();
+  me.name = v || '익명'; saveMe(); return me.name;
+}
 
 /* ---------------- 상수 ---------------- */
 const POST_COLORS = [
@@ -501,10 +617,19 @@ let searchQuery = '';
 
 async function persist() {
   const r = await store.save(state);
-  if (r === 'quota') toast('브라우저 저장 용량(약 5MB)을 초과했어요 — SDK 연결 전까지는 큰 파일을 줄여주세요');
+  if (r === 'quota') toast('브라우저 저장 용량(약 5MB)을 초과했어요 — 큰 파일을 줄여주세요');
   else if (r === 'disabled' && !persist.warned) { persist.warned = true; toast('이 환경에서는 저장이 꺼져 있어요 — 새로고침하면 사라져요'); }
   renderMeta();
 }
+
+/* 원격 변경 반영: 보드 안에서 뭔가 입력 중이면 입력이 끝난 뒤 렌더 */
+let pendingRender = false;
+function isTypingInBoard() {
+  const a = document.activeElement;
+  return a && $('#boardInner').contains(a) && (a.tagName === 'INPUT' || a.isContentEditable);
+}
+function safeRender() { if (isTypingInBoard()) pendingRender = true; else render(); }
+document.addEventListener('focusout', () => { if (pendingRender && !isTypingInBoard()) setTimeout(() => { if (pendingRender) { pendingRender = false; render(); } }, 50); });
 
 /* ---------------- 유틸 ---------------- */
 const $ = (s) => document.querySelector(s);
@@ -682,7 +807,8 @@ function renderAttachment(a, opts = {}) {
       const total = a.options.reduce((s, o) => s + o.votes, 0);
       return `<div class="att"><div class="poll">${a.options.map((o, i) => {
         const pct = total ? Math.round((o.votes / total) * 100) : 0;
-        return `<button class="poll-opt ${a.voted === i ? 'mine' : ''}" data-i="${i}" ${opts.postId ? '' : 'disabled'}><div class="bar" style="transform:scaleX(${pct / 100})"></div><div class="lbl"><span>${esc(o.text)}</span><span>${total ? pct + '%' : ''}</span></div></button>`;
+        const mine = opts.postId && myFlag(opts.postId).poll === i;
+        return `<button class="poll-opt ${mine ? 'mine' : ''}" data-i="${i}" ${opts.postId ? '' : 'disabled'}><div class="bar" style="transform:scaleX(${pct / 100})"></div><div class="lbl"><span>${esc(o.text)}</span><span>${total ? pct + '%' : ''}</span></div></button>`;
       }).join('')}<div class="poll-total">${total}표</div></div></div>`;
     }
   }
@@ -690,12 +816,12 @@ function renderAttachment(a, opts = {}) {
 }
 
 function reactionButtons(p) {
-  const m = state.settings.reactions;
+  const m = state.settings.reactions, f = myFlag(p.id);
   if (m === 'none') return '';
-  if (m === 'like') return `<button class="like ${p.liked ? 'liked' : ''}" title="좋아요">${I.heart}${p.likes || ''}</button>`;
-  if (m === 'vote') return `<button class="vote ${p.myVote === 'up' ? 'mine' : ''}" data-v="up">👍 ${p.up || ''}</button><button class="vote ${p.myVote === 'down' ? 'mine' : ''}" data-v="down">👎 ${p.down || ''}</button>`;
+  if (m === 'like') return `<button class="like ${f.liked ? 'liked' : ''}" title="좋아요">${I.heart}${p.likes || ''}</button>`;
+  if (m === 'vote') return `<button class="vote ${f.vote === 'up' ? 'mine' : ''}" data-v="up">👍 ${p.up || ''}</button><button class="vote ${f.vote === 'down' ? 'mine' : ''}" data-v="down">👎 ${p.down || ''}</button>`;
   const rx = p.reactions || {};
-  return Object.entries(rx).filter(([, n]) => n > 0).map(([e, n]) => `<button class="rx ${p.myReaction === e ? 'mine' : ''}" data-e="${e}">${e} ${n}</button>`).join('')
+  return Object.entries(rx).filter(([, n]) => n > 0).map(([e, n]) => `<button class="rx ${f.reaction === e ? 'mine' : ''}" data-e="${e}">${e} ${n}</button>`).join('')
     + `<button class="rx-add" title="반응 추가">${I.smile}</button>`;
 }
 
@@ -726,18 +852,19 @@ function renderPost(p) {
   const on = (sel, ev, fn) => el.querySelectorAll(sel).forEach((n) => n.addEventListener(ev, fn));
   on('.approve', 'click', () => { delete p.approved; persist(); render(); });
   on('.rej', 'click', () => { state.posts = state.posts.filter((x) => x.id !== p.id); persist(); render(); });
-  on('.like', 'click', () => { p.liked = !p.liked; p.likes = (p.likes || 0) + (p.liked ? 1 : -1); persist(); render(); });
+  const f = myFlag(p.id);
+  on('.like', 'click', () => { f.liked = !f.liked; p.likes = Math.max(0, (p.likes || 0) + (f.liked ? 1 : -1)); saveMe(); persist(); render(); });
   on('.vote', 'click', (e) => {
     const v = e.currentTarget.dataset.v;
-    if (p.myVote) p[p.myVote] = Math.max(0, (p[p.myVote] || 0) - 1);
-    if (p.myVote === v) p.myVote = null; else { p.myVote = v; p[v] = (p[v] || 0) + 1; }
-    persist(); render();
+    if (f.vote) p[f.vote] = Math.max(0, (p[f.vote] || 0) - 1);
+    if (f.vote === v) f.vote = null; else { f.vote = v; p[v] = (p[v] || 0) + 1; }
+    saveMe(); persist(); render();
   });
   const react = (e) => {
     p.reactions = p.reactions || {};
-    if (p.myReaction) p.reactions[p.myReaction] = Math.max(0, (p.reactions[p.myReaction] || 0) - 1);
-    if (p.myReaction === e) p.myReaction = null; else { p.myReaction = e; p.reactions[e] = (p.reactions[e] || 0) + 1; }
-    persist(); render();
+    if (f.reaction) p.reactions[f.reaction] = Math.max(0, (p.reactions[f.reaction] || 0) - 1);
+    if (f.reaction === e) f.reaction = null; else { f.reaction = e; p.reactions[e] = (p.reactions[e] || 0) + 1; }
+    saveMe(); persist(); render();
   };
   on('.rx', 'click', (e) => react(e.currentTarget.dataset.e));
   on('.rx-add', 'click', (e) => openMenu(e, EMOJIS.map((em) => ({ label: em, action: () => react(em) })), { row: true }));
@@ -745,15 +872,15 @@ function renderPost(p) {
   on('.comment-form', 'submit', (e) => {
     e.preventDefault();
     const text = e.target.querySelector('input').value.trim(); if (!text) return;
-    p.comments.push({ id: uid(), author: '나', text, createdAt: Date.now() });
+    p.comments.push({ id: uid(), author: ensureName(), text, createdAt: Date.now() });
     persist(); render();
     document.querySelector(`.post[data-id="${p.id}"] .comments`)?.classList.add('open');
   });
   on('.poll-opt', 'click', (e) => {
     const i = +e.currentTarget.dataset.i, a = p.attachment;
-    if (a.voted === i) return;
-    if (a.voted != null) a.options[a.voted].votes--;
-    a.options[i].votes++; a.voted = i; persist(); render();
+    if (f.poll === i) return;
+    if (f.poll != null && a.options[f.poll]) a.options[f.poll].votes = Math.max(0, a.options[f.poll].votes - 1);
+    a.options[i].votes++; f.poll = i; saveMe(); persist(); render();
   });
   on('.post-menu-btn', 'click', (e) => openPostMenu(e, p.id));
 
@@ -900,9 +1027,18 @@ $('#composerSubmit').addEventListener('click', submitPost);
 $('#colorPick').addEventListener('click', (e) => openMenu(e, POST_COLORS.map((c) => ({ label: c.name, html: `<span class="dot" style="background:${c.v}"></span>`, action: () => { selectedColor = c.v; updateComposerUI(); } }))));
 $('#sectionPick').addEventListener('click', (e) => openMenu(e, state.sections.map((s) => ({ label: s.name, action: () => { selectedSection = s.id; updateComposerUI(); } }))));
 
-function submitPost() {
+async function submitPost() {
   const title = $('#postTitle').value.trim(), body = $('#postBody').value.trim();
   if (!title && !body && !attachment) return toast('내용을 입력해주세요');
+  const btn = $('#composerSubmit');
+  if (btn.disabled) return;
+  const author = ensureName();
+  // data: URL 첨부는 저장소에 올리고 URL로 바꿈 (Storage → 압축 인라인 순)
+  if (attachment?.src?.startsWith('data:')) {
+    btn.disabled = true; btn.textContent = '업로드 중...';
+    try { attachment = { ...attachment, src: await store.uploadFile(attachment.src, attachment.name || attachment.type, attachment.mime || '') }; }
+    catch (e) { toast(e.message); btn.disabled = false; btn.textContent = editing ? '저장' : '게시'; return; }
+  }
   if (editing) {
     const p = state.posts.find((x) => x.id === editing);
     const moved = p.sectionId !== selectedSection;
@@ -910,7 +1046,7 @@ function submitPost() {
     if (moved) movePost(p.id, selectedSection, null);
   } else {
     const inSec = state.posts.filter((p) => p.sectionId === selectedSection);
-    const post = { id: uid(), sectionId: selectedSection, title, body, color: selectedColor, attachment, author: '나', likes: 0, liked: false, comments: [], reactions: {}, createdAt: Date.now(), order: state.newPos === 'top' ? -1 : inSec.length };
+    const post = { id: uid(), sectionId: selectedSection, title, body, color: selectedColor, attachment, author, likes: 0, comments: [], reactions: {}, createdAt: Date.now(), order: state.newPos === 'top' ? -1 : inSec.length };
     if (state.settings.moderation === 'manual') post.approved = false;
     state.posts.push(post); reorderSection(selectedSection);
     if (post.approved === false) toast('콘텐츠 검토가 수동이라 승인 대기 상태로 게시됐어요');
@@ -1258,8 +1394,10 @@ const ACTIONS = {
     b.querySelectorAll('[data-c]').forEach((d) => d.addEventListener('click', () => { state.bg = d.dataset.c; state.bgImage = null; persist(); render(); renderSettings(); closeToolPanel(); }));
     b.querySelector('#bgFile').addEventListener('change', async (e) => {
       const f = e.target.files[0]; if (!f) return;
-      if (f.size > 2 * 1024 * 1024) return toast('2MB 이하 이미지를 사용해주세요');
-      state.bgImage = await readFile(f); persist(); render(); renderSettings(); closeToolPanel();
+      if (f.size > 4 * 1024 * 1024) return toast('4MB 이하 이미지를 사용해주세요');
+      try { state.bgImage = await store.uploadFile(await readFile(f), 'bg-' + f.name, f.type); }
+      catch (err) { return toast(err.message); }
+      persist(); render(); renderSettings(); closeToolPanel();
     });
     b.querySelector('#bgClear')?.addEventListener('click', () => { state.bgImage = null; persist(); render(); renderSettings(); closeToolPanel(); });
   },
@@ -1353,6 +1491,10 @@ $('#slidePrev').addEventListener('click', () => { slideIdx = (slideIdx - 1 + sli
 $('#slideNext').addEventListener('click', () => { slideIdx = (slideIdx + 1) % slideList.length; renderSlide(); });
 document.addEventListener('keydown', (e) => { if (!$('#slideshow').classList.contains('open')) return; if (e.key === 'ArrowRight') $('#slideNext').click(); if (e.key === 'ArrowLeft') $('#slidePrev').click(); });
 $('#fab').addEventListener('click', () => openComposer());
+$('#avatarBtn').addEventListener('click', () => {
+  const v = prompt('게시물에 표시할 이름', me.name || ''); if (v === null) return;
+  me.name = v.trim() || '익명'; saveMe(); toast(`이름: ${me.name}`);
+});
 
 /* ---------------- 시작 ---------------- */
 function migrate(s) {
@@ -1361,9 +1503,31 @@ function migrate(s) {
   s.posts.forEach((p) => { if (p.image && !p.attachment) { p.attachment = { type: 'image', src: p.image }; delete p.image; } p.comments ||= []; p.reactions ||= {}; });
   return s;
 }
+function setStatus(kind, text) {
+  const el = $('#status'); el.className = 'status ' + kind; el.textContent = text;
+}
 (async () => {
-  const saved = await store.load();
-  if (saved) state = migrate(saved);
+  let saved = null;
+  if (store.realtime) {
+    setStatus('wait', '연결 중…');
+    try {
+      saved = await store.init((remote) => {
+        if (!remote) return;
+        state = migrate(remote); store.remember(state); safeRender();
+      });
+      setStatus('live', '● 실시간');
+    } catch (e) {
+      console.error(e);
+      setStatus('off', '● 로컬 (연결 실패)');
+      toast('Firebase 연결 실패 — 로컬 저장으로 동작해요. Firestore 데이터베이스/규칙을 확인하세요 (' + (e.code || e.message) + ')');
+      store = new LocalStore('jadlet-v1'); saved = await store.init();
+    }
+  } else {
+    setStatus('off', '● 로컬');
+    saved = await store.init();
+  }
+  if (saved) { state = migrate(saved); store.remember(state); }
+  else if (store.realtime) { state.id = BOARD_ID; await persist(); }   // 보드 문서 생성
   render();
   setInterval(renderMeta, 30000);
 })();
