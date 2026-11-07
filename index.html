@@ -37,6 +37,9 @@
   .logo { font-weight: 800; font-size: 20px; letter-spacing: -.5px; opacity: .9; }
   .status { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 10px; background: var(--chip); color: var(--text-dim); white-space: nowrap; }
   .status.live { color: #7CFC9B; } .status.off { color: #ffb4a2; } .status:empty { display: none; }
+  .status.admin { background: rgba(255,232,61,.2); color: var(--yellow); }
+  /* 참가자 화면: 보드 전체를 바꾸는 버튼은 숨김 */
+  body.viewer #settingsBtn, body.viewer #layoutBtn, body.viewer #shareBtn, body.viewer .icon-group .sep, body.viewer .new-section, body.viewer .section-menu { display: none !important; }
   .topbar-right { display: flex; align-items: center; gap: 10px; }
   .search { display: flex; align-items: center; gap: 6px; background: var(--chip); border-radius: 18px; height: 36px; padding: 0 12px; width: 80px; transition: width .2s; }
   .search:focus-within { width: 220px; background: var(--chip-hover); }
@@ -52,13 +55,15 @@
 
   /* ---------- Board ---------- */
   .board-header { position: fixed; top: 62px; left: 80px; z-index: 10; max-width: 60vw; }
+  /* 게시물은 제목 아래 영역 안에서만 스크롤 → 제목과 겹치지 않음 (--board-top은 JS가 헤더 높이로 계산) */
   .board-meta { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
   .board-title-row { display: flex; align-items: center; gap: 8px; }
   .board-icon { font-size: 26px; line-height: 1; }
   .board-title { font-size: 26px; font-weight: 800; outline: 0; border-radius: 6px; padding: 2px 4px; margin-left: -4px; min-width: 120px; }
   .board-title:focus { background: rgba(255,255,255,.08); }
   .board-desc { font-size: 14px; color: var(--text-dim); margin-top: 4px; }
-  .board { position: absolute; inset: 0; padding: 150px 40px 100px; overflow: auto; z-index: 1; }
+  .board { position: absolute; top: var(--board-top, 140px); left: 0; right: 0; bottom: 0; padding: 12px 40px 100px; overflow: auto; z-index: 1;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px); mask-image: linear-gradient(to bottom, transparent 0, #000 14px); }
   .sections { display: flex; gap: 40px; align-items: flex-start; justify-content: center; min-width: max-content; margin: 0 auto; }
   .section { width: var(--pw); flex: none; }
   .section-head { display: flex; align-items: center; justify-content: space-between; background: var(--panel); border-radius: 8px; height: 46px; padding: 0 6px 0 12px; margin-bottom: 8px; }
@@ -340,7 +345,7 @@
 
   @media (max-width: 900px) {
     .board-header { left: 24px; right: 24px; max-width: none; }
-    .board { padding: 200px 20px 100px; }
+    .board { padding: 12px 20px 100px; }
     .sections { justify-content: flex-start; }
   }
 
@@ -350,7 +355,7 @@
     body::after, .topbar, .fab, .mini-bar, .drawer, .overlay, .menu, .toast, .section-add, .new-section, .post-menu-btn, .comment-form, .board-meta { display: none !important; }
     .board-header { position: static; color: #000; margin: 0 0 20px; max-width: none; }
     .board-desc, .board-meta { color: #555; }
-    .board { position: static; padding: 20px; overflow: visible; }
+    .board { position: static; padding: 20px; overflow: visible; -webkit-mask-image: none; mask-image: none; }
     .sections { flex-wrap: wrap; justify-content: flex-start; min-width: 0; }
     .section-head { background: #eee; color: #000; }
     .post { box-shadow: none; border: 1px solid #ccc; break-inside: avoid; color: #000; background: #fff !important; }
@@ -362,7 +367,7 @@
 
 <!-- ===== Top bar ===== -->
 <header class="topbar">
-  <div style="display:flex;align-items:center;gap:10px"><div class="logo">Jadlet</div><span class="status" id="status"></span></div>
+  <div style="display:flex;align-items:center;gap:10px"><div class="logo">Jadlet</div><span class="status" id="status"></span><span class="status admin" id="roleChip"></span></div>
   <div class="topbar-right">
     <label class="search">
       <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -543,21 +548,78 @@ class FirebaseStore {
     this.lastMeta = JSON.stringify(clean(meta));
     this.lastPosts = new Map(posts.map((p) => [p.id, JSON.stringify(clean(p))]));
   }
+  /* 저장: 바뀐 "필드"만 원자적으로 씀 → 여러 명이 동시에 좋아요·댓글·투표해도 서로 덮어쓰지 않음
+   *  - 새 게시물: set / 지운 게시물: delete
+   *  - 좋아요·반응 수: increment(차이값), 댓글: arrayUnion(새 댓글), 투표: 트랜잭션
+   *  - 나머지(제목·본문·순서·섹션 등): 그 필드만 update */
   async save(state) {
     const fs = this.fs, batch = fs.writeBatch(this.db);
     const { posts, ...meta } = state;
     const metaC = clean(meta), metaJ = JSON.stringify(metaC);
-    let n = 0;
-    if (metaJ !== this.lastMeta) { batch.set(this.boardRef, metaC); this.lastMeta = metaJ; n++; }
+    let n = 0; const updates = [], polls = [];
+    if (metaJ !== this.lastMeta) {
+      const prev = this.lastMeta ? JSON.parse(this.lastMeta) : null;
+      if (!prev) batch.set(this.boardRef, metaC);
+      else {
+        const ch = {};
+        for (const k of new Set([...Object.keys(prev), ...Object.keys(metaC)]))
+          if (JSON.stringify(prev[k]) !== JSON.stringify(metaC[k])) ch[k] = k in metaC ? metaC[k] : fs.deleteField();
+        batch.set(this.boardRef, ch, { merge: true });
+      }
+      this.lastMeta = metaJ; n++;
+    }
     const seen = new Set();
     for (const p of posts) {
       const c = clean(p), j = JSON.stringify(c); seen.add(p.id);
-      if (this.lastPosts.get(p.id) !== j) { batch.set(fs.doc(this.postsRef, p.id), c); this.lastPosts.set(p.id, j); n++; }
+      const prevJ = this.lastPosts.get(p.id);
+      if (prevJ === j) continue;
+      this.lastPosts.set(p.id, j); n++;
+      const ref = fs.doc(this.postsRef, p.id);
+      if (!prevJ) { batch.set(ref, c); continue; }
+      const { upd, poll } = this.diffPost(JSON.parse(prevJ), c);
+      if (Object.keys(upd).length) updates.push([ref, upd]);
+      if (poll) polls.push([ref, poll]);
     }
     for (const id of [...this.lastPosts.keys()]) if (!seen.has(id)) { batch.delete(fs.doc(this.postsRef, id)); this.lastPosts.delete(id); n++; }
     if (!n) return true;
-    try { await batch.commit(); return true; }
-    catch (e) { console.error('save', e); toast('저장 실패: ' + (e.code === 'permission-denied' ? 'Firestore 규칙에서 쓰기를 허용해주세요' : e.message)); return 'error'; }
+    const ignoreGone = (e) => { if (e.code !== 'not-found') throw e; }; // 그새 다른 사람이 지운 게시물이면 조용히 무시
+    try {
+      await Promise.all([
+        batch.commit(),
+        ...updates.map(([r, u]) => fs.updateDoc(r, u).catch(ignoreGone)),
+        ...polls.map(([r, d]) => this.applyPoll(r, d).catch(ignoreGone)),
+      ]);
+      return true;
+    } catch (e) { console.error('save', e); toast('저장 실패: ' + (e.code === 'permission-denied' ? 'Firestore 규칙에서 쓰기를 허용해주세요' : e.message)); return 'error'; }
+  }
+  diffPost(prev, c) {
+    const fs = this.fs, upd = {}; let poll = null;
+    const keys = new Set([...Object.keys(prev), ...Object.keys(c)]); keys.delete('id');
+    for (const k of keys) {
+      const a = prev[k], b = c[k];
+      if (JSON.stringify(a) === JSON.stringify(b)) continue;
+      if (['likes', 'up', 'down'].includes(k) && typeof (b ?? 0) === 'number') upd[k] = fs.increment((b || 0) - (a || 0));
+      else if (k === 'reactions' && a && b) {
+        for (const e of new Set([...Object.keys(a), ...Object.keys(b)])) { const d = (b[e] || 0) - (a[e] || 0); if (d) upd['reactions.' + e] = fs.increment(d); }
+      } else if (k === 'comments' && Array.isArray(a) && Array.isArray(b)) {
+        const aIds = new Set(a.map((x) => x.id)), bIds = new Set(b.map((x) => x.id));
+        const added = b.filter((x) => !aIds.has(x.id)), removed = a.filter((x) => !bIds.has(x.id));
+        upd.comments = !removed.length ? fs.arrayUnion(...added) : !added.length ? fs.arrayRemove(...removed) : b;
+      } else if (k === 'attachment' && a?.type === 'poll' && b?.type === 'poll' && a.options.length === b.options.length && a.options.every((o, i) => o.text === b.options[i].text)) {
+        poll = b.options.map((o, i) => (o.votes || 0) - (a.options[i].votes || 0));
+      } else upd[k] = b === undefined ? fs.deleteField() : b;
+    }
+    return { upd, poll };
+  }
+  /* 투표는 배열 안 숫자라 increment가 안 됨 → 트랜잭션으로 서버 최신값에 차이만 더함 */
+  applyPoll(ref, deltas) {
+    const fs = this.fs;
+    return fs.runTransaction(this.db, async (tx) => {
+      const snap = await tx.get(ref); if (!snap.exists()) return;
+      const att = snap.data().attachment; if (att?.type !== 'poll') return;
+      att.options.forEach((o, i) => { o.votes = Math.max(0, (o.votes || 0) + (deltas[i] || 0)); });
+      tx.update(ref, { attachment: att });
+    });
   }
   /* 첨부 업로드: Storage → (실패 시) 이미지 압축 인라인 → 크기 초과면 에러 */
   async uploadFile(dataUrl, name = 'file', mime = '') {
@@ -587,6 +649,45 @@ const me = (() => { try { return JSON.parse(localStorage.getItem('jadlet-me')) |
 me.flags ||= {};
 const saveMe = () => { try { localStorage.setItem('jadlet-me', JSON.stringify(me)); } catch {} };
 const myFlag = (id) => (me.flags[id] ||= {});
+me.uid ||= Math.random().toString(36).slice(2) + Date.now().toString(36); // 내 게시물 구분용 (브라우저별)
+me.admin ||= {}; saveMe();
+
+/* ---------- 관리자(교사) 잠금 ----------
+ * 보드에 관리자 PIN(해시)이 설정되면, PIN으로 로그인한 브라우저만
+ * 설정·레이아웃·섹션 편집·전체 초기화·가져오기·남의 게시물 수정/삭제/이동을 할 수 있음.
+ * 참가자는 글쓰기·댓글·반응·투표, 자기 글 수정/삭제/이동만 가능. */
+const isAdmin = () => !state.adminHash || me.admin[BOARD_ID] === state.adminHash;
+const canEdit = (p) => isAdmin() || (!!p.uid && p.uid === me.uid);
+async function pinHash(pin) {
+  const txt = BOARD_ID + ':' + pin;
+  try { const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(txt)); return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join(''); }
+  catch { let h = 5381; for (const c of txt) h = ((h << 5) + h + c.charCodeAt(0)) | 0; return 'd' + (h >>> 0).toString(16); }
+}
+function needAdmin() { if (isAdmin()) return true; toast('관리자(선생님)만 할 수 있어요'); return false; }
+
+/* ---------- 자동 백업 (관리자 브라우저에만, 최근 10개 / 3분 간격) ---------- */
+const BK_KEY = `jadlet-backup-${BOARD_ID}`;
+function readBackups() { try { return JSON.parse(localStorage.getItem(BK_KEY)) || []; } catch { return []; } }
+function autoBackup() {
+  if (!store.realtime || !isAdmin() || !state.posts.length) return; // 빈 보드는 백업하지 않음 (초기화돼도 이전 백업 보존)
+  const list = readBackups(), now = Date.now(), last = list[list.length - 1];
+  const snap = { start: now, at: now, n: state.posts.length, data: clean(state) };
+  if (last && now - last.start < 3 * 60e3 && state.posts.length >= last.n * 0.5) { snap.start = last.start; list[list.length - 1] = snap; }
+  else list.push(snap); // 3분이 지났거나 게시물이 절반 넘게 줄었으면 새 칸 → 이전 상태 보존
+  while (list.length > 10) list.shift();
+  while (list.length) { try { localStorage.setItem(BK_KEY, JSON.stringify(list)); break; } catch { if (list.length === 1) break; list.shift(); } }
+}
+const backupSoon = () => { clearTimeout(backupSoon._t); backupSoon._t = setTimeout(autoBackup, 2000); };
+function restoreMenu(e) {
+  const list = readBackups().slice().reverse();
+  if (!list.length) return toast('아직 백업이 없어요 (관리자 브라우저에서 게시물이 생기면 자동 백업돼요)');
+  const fmt = (t) => new Date(t).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  openMenu(e, list.map((b) => ({ label: `${fmt(b.at)} · 게시물 ${b.n}개`, action: () => {
+    if (!confirm(`${fmt(b.at)} 상태(게시물 ${b.n}개)로 되돌릴까요?\n지금 보드 내용은 이 백업으로 바뀌어요.`)) return;
+    state = migrate(b.data); persist(); render(); toast('백업으로 복원했어요');
+  } })));
+}
+
 /* 이름은 묻지 않음 — 필요하면 오른쪽 위 아바타(🐯)를 눌러 설정 */
 function ensureName() { return me.name || '익명'; }
 
@@ -627,7 +728,7 @@ async function persist() {
   const r = await store.save(state);
   if (r === 'quota') toast('브라우저 저장 용량(약 5MB)을 초과했어요 — 큰 파일을 줄여주세요');
   else if (r === 'disabled' && !persist.warned) { persist.warned = true; toast('이 환경에서는 저장이 꺼져 있어요 — 새로고침하면 사라져요'); }
-  renderMeta();
+  renderMeta(); backupSoon();
 }
 
 /* 원격 변경 반영: 보드 안에서 뭔가 입력 중이면 입력이 끝난 뒤 렌더 */
@@ -727,6 +828,16 @@ const I = {
 /* =====================================================================
  *  렌더
  * ===================================================================== */
+function applyRole() {
+  const admin = isAdmin();
+  document.body.classList.toggle('viewer', !admin);
+  $('#boardTitle').contentEditable = admin ? 'true' : 'false';
+  $('#roleChip').textContent = state.adminHash && admin ? '관리자' : '';
+}
+/* 헤더(제목·설명) 높이만큼 보드 시작 위치를 내림 */
+function fitBoardTop() { const h = $('.board-header'); document.documentElement.style.setProperty('--board-top', Math.ceil(h.getBoundingClientRect().bottom + 6) + 'px'); }
+new ResizeObserver(fitBoardTop).observe(document.querySelector('.board-header'));
+addEventListener('resize', fitBoardTop);
 function renderMeta() { $('#boardMeta').textContent = `${state.posts.length}공용 • ${timeAgo(state.createdAt)}`; }
 
 function applyDesign() {
@@ -750,6 +861,7 @@ const matches = (p) => { const q = searchQuery.trim().toLowerCase(); return !q |
 
 function render() {
   applyDesign();
+  applyRole();
   if (document.activeElement !== $('#boardTitle')) $('#boardTitle').textContent = state.title;
   $('#boardIcon').textContent = state.settings.icon || '';
   $('#boardDesc').textContent = state.settings.desc || '';
@@ -766,7 +878,7 @@ function renderColumns(inner) {
     el.className = 'section'; el.dataset.id = sec.id;
     el.innerHTML = `
       <div class="section-head">
-        <div class="section-name" contenteditable="true" spellcheck="false">${esc(sec.name)}</div>
+        <div class="section-name" contenteditable="${isAdmin()}" spellcheck="false">${esc(sec.name)}</div>
         <button class="icon-btn section-menu" title="섹션 메뉴">${I.dots}</button>
       </div>
       <button class="section-add" title="게시물 추가">${I.plus}</button>
@@ -858,11 +970,12 @@ function renderPost(p) {
   const s = state.settings, dark = s.scheme === 'dark', manual = s.sort === 'manual';
   const el = document.createElement('article');
   el.className = 'post' + (p.approved === false ? ' pending' : '') + (s.copyProtect === 'on' ? ' noselect' : '');
-  el.draggable = manual; el.dataset.id = p.id;
+  const mine = canEdit(p);
+  el.draggable = manual && mine; el.dataset.id = p.id;
   el.style.background = dark ? '' : (p.color || '#fff');
   el.style.borderTopColor = p.color && p.color !== '#ffffff' ? darken(p.color, dark ? 0.45 : 0.25) : 'transparent';
   el.innerHTML = `
-    ${p.approved === false ? `<div class="pending-bar">승인 대기 중<button class="approve">승인</button><button class="rej">거절</button></div>` : ''}
+    ${p.approved === false ? `<div class="pending-bar">승인 대기 중${isAdmin() ? '<button class="approve">승인</button><button class="rej">거절</button>' : ''}</div>` : ''}
     ${renderAttachment(p.attachment, { postId: p.id })}
     ${p.title || p.body ? `<div class="post-body">${p.title ? `<div class="post-title">${linkify(p.title)}</div>` : ''}${p.body ? `<div class="post-text">${linkify(p.body)}</div>` : ''}</div>` : '<div style="height:8px"></div>'}
     <div class="post-footer">
@@ -876,7 +989,7 @@ function renderPost(p) {
       ${p.comments.map((c) => `<div class="comment">${s.commentAuthor ? `<b>${esc(c.author)}</b>` : ''}${esc(c.text)}${s.commentAuthor ? `<span class="ts">${timeAgo(c.createdAt)}</span>` : ''}</div>`).join('')}
       <form class="comment-form"><input type="text" placeholder="댓글 추가..." maxlength="300"><button type="submit">게시</button></form>
     </div>` : ''}
-    <button class="post-menu-btn" title="메뉴">${I.dots}</button>`;
+    ${mine ? `<button class="post-menu-btn" title="메뉴">${I.dots}</button>` : ''}`;
 
   const on = (sel, ev, fn) => el.querySelectorAll(sel).forEach((n) => n.addEventListener(ev, fn));
   on('.approve', 'click', () => { delete p.approved; persist(); render(); });
@@ -913,7 +1026,7 @@ function renderPost(p) {
   });
   on('.post-menu-btn', 'click', (e) => openPostMenu(e, p.id));
 
-  if (manual) {
+  if (manual && mine) {
     el.addEventListener('dragstart', (e) => {
       if (e.target.closest('input, textarea, [contenteditable="true"]')) return e.preventDefault();
       dragId = p.id;
@@ -948,7 +1061,7 @@ function dropTarget(postsEl, y) {
 /* ---------------- 조작 ---------------- */
 function reorderSection(sid) { state.posts.filter((p) => p.sectionId === sid).sort((a, b) => a.order - b.order).forEach((p, i) => (p.order = i)); }
 function movePost(id, toSid, beforeId) {
-  const p = state.posts.find((x) => x.id === id); if (!p) return;
+  const p = state.posts.find((x) => x.id === id); if (!p || !canEdit(p)) return;
   const from = p.sectionId; p.sectionId = toSid;
   if (beforeId) p.order = state.posts.find((x) => x.id === beforeId).order - 0.5;
   else p.order = state.posts.filter((x) => x.sectionId === toSid && x.id !== id).length + 1;
@@ -956,12 +1069,13 @@ function movePost(id, toSid, beforeId) {
   persist(); render();
 }
 function addSection() {
+  if (!needAdmin()) return;
   state.sections.push({ id: uid(), name: `섹션 ${state.sections.length + 1}` });
   persist(); render();
   const names = document.querySelectorAll('.section-name'), last = names[names.length - 1];
   if (last) { last.focus(); document.getSelection().selectAllChildren(last); }
 }
-function deletePost(id) { if (!confirm('이 게시물을 삭제할까요?')) return; state.posts = state.posts.filter((p) => p.id !== id); persist(); render(); }
+function deletePost(id) { const p = state.posts.find((x) => x.id === id); if (!p || !canEdit(p)) return; if (!confirm('이 게시물을 삭제할까요?')) return; state.posts = state.posts.filter((p) => p.id !== id); persist(); render(); }
 
 /* ---------------- 팝오버 메뉴 ---------------- */
 const menu = $('#menu');
@@ -1001,6 +1115,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function openSectionMenu(e, id) {
+  if (!needAdmin()) return;
   const idx = state.sections.findIndex((s) => s.id === id);
   openMenu(e, [
     { label: '이름 변경', action: () => { const el = document.querySelector(`.section[data-id="${id}"] .section-name`); el.focus(); document.getSelection().selectAllChildren(el); } },
@@ -1016,7 +1131,7 @@ function openSectionMenu(e, id) {
   ]);
 }
 function openPostMenu(e, id) {
-  const p = state.posts.find((x) => x.id === id);
+  const p = state.posts.find((x) => x.id === id); if (!p || !canEdit(p)) return;
   const others = state.sections.filter((s) => s.id !== p.sectionId);
   openMenu(e, [
     { label: '수정', action: () => openComposer({ postId: id }) },
@@ -1025,11 +1140,18 @@ function openPostMenu(e, id) {
   ]);
 }
 $('#moreBtn').addEventListener('click', (e) => openMenu(e, [
-  { label: 'JSON 내보내기', action: () => download(`${state.title}.json`, JSON.stringify(state, null, 2), 'application/json') },
-  { label: 'JSON 가져오기', action: importJSON }, '-',
-  { label: '전체 초기화', danger: true, action: () => { if (confirm('모든 데이터를 삭제할까요?')) { state = defaultState(); persist(); render(); } } },
+  { label: 'JSON 내보내기 (백업 파일 저장)', action: () => download(`${state.title}.json`, JSON.stringify(state, null, 2), 'application/json') },
+  ...(isAdmin() ? [
+    { label: 'JSON 가져오기', action: importJSON },
+    ...(store.realtime ? [{ label: '자동 백업에서 복원', action: () => setTimeout(() => restoreMenu({ currentTarget: $('#moreBtn'), stopPropagation() {} }), 0) }] : []), '-',
+    { label: '전체 초기화', danger: true, action: () => {
+      if (!needAdmin() || !confirm('모든 게시물이 모든 사람 화면에서 삭제돼요. 정말 초기화할까요?')) return;
+      if ((prompt('확인을 위해 "초기화"라고 입력하세요') || '').trim() !== '초기화') return toast('취소했어요');
+      const keep = { adminHash: state.adminHash }; state = { ...defaultState(), ...keep, id: BOARD_ID }; persist(); render();
+    } },
+  ] : []),
 ]));
-$('#layoutBtn').addEventListener('click', (e) => openMenu(e, LAYOUTS.map(([v, l]) => ({ label: l, on: state.settings.layout === v, action: () => { state.settings.layout = v; persist(); render(); } }))));
+$('#layoutBtn').addEventListener('click', (e) => needAdmin() && openMenu(e, LAYOUTS.map(([v, l]) => ({ label: l, on: state.settings.layout === v, action: () => { state.settings.layout = v; persist(); render(); } }))));
 
 /* =====================================================================
  *  작성창
@@ -1107,9 +1229,10 @@ async function submitPost() {
     if (moved) movePost(p.id, selectedSection, null);
   } else {
     const inSec = state.posts.filter((p) => p.sectionId === selectedSection);
-    const post = { id: uid(), sectionId: selectedSection, title, body, color: selectedColor, attachment, author, likes: 0, comments: [], reactions: {}, createdAt: Date.now(), order: state.newPos === 'top' ? -1 : inSec.length };
+    const ords = inSec.map((x) => x.order || 0);
+    const post = { id: uid(), uid: me.uid, sectionId: selectedSection, title, body, color: selectedColor, attachment, author, likes: 0, comments: [], reactions: {}, createdAt: Date.now(), order: state.newPos === 'top' ? (ords.length ? Math.min(...ords) - 1 : 0) : (ords.length ? Math.max(...ords) + 1 : 0) };
     if (state.settings.moderation === 'manual') post.approved = false;
-    state.posts.push(post); reorderSection(selectedSection);
+    state.posts.push(post);
     if (post.approved === false) toast('콘텐츠 검토가 수동이라 승인 대기 상태로 게시됐어요');
   }
   persist(); render(); closeComposer();
@@ -1326,8 +1449,8 @@ const DD_OPTS = { 'settings.layout': LAYOUTS, 'settings.sort': SORTS, 'settings.
 function openDrawer(id) { closeDrawer('settingsDrawer'); closeDrawer('shareDrawer'); (id === 'settingsDrawer' ? renderSettings : renderShare)(); $('#' + id).classList.add('open'); }
 function closeDrawer(id) { $('#' + id).classList.remove('open'); }
 document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => closeDrawer(b.dataset.close)));
-$('#settingsBtn').addEventListener('click', () => openDrawer('settingsDrawer'));
-$('#shareBtn').addEventListener('click', () => openDrawer('shareDrawer'));
+$('#settingsBtn').addEventListener('click', () => { if (needAdmin()) openDrawer('settingsDrawer'); });
+$('#shareBtn').addEventListener('click', () => { if (needAdmin()) openDrawer('shareDrawer'); });
 
 /* 드로어 내부 이벤트 위임 */
 ['settingsBody', 'shareBody'].forEach((id) => {
@@ -1522,10 +1645,11 @@ function exportRows() {
 
 /* ---------------- 보드 제목 / 검색 / 기타 ---------------- */
 const titleEl = $('#boardTitle');
-titleEl.addEventListener('blur', () => { const v = titleEl.textContent.trim() || state.title; titleEl.textContent = v; if (v !== state.title) { state.title = v; persist(); } });
+titleEl.addEventListener('blur', () => { if (!isAdmin()) return; const v = titleEl.textContent.trim() || state.title; titleEl.textContent = v; if (v !== state.title) { state.title = v; persist(); } });
 titleEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); titleEl.blur(); } });
 $('#searchInput').addEventListener('input', (e) => { searchQuery = e.target.value; render(); });
 function importJSON() {
+  if (!needAdmin()) return;
   const input = document.createElement('input'); input.type = 'file'; input.accept = 'application/json';
   input.onchange = () => {
     const f = input.files[0]; if (!f) return;
@@ -1552,9 +1676,27 @@ $('#slidePrev').addEventListener('click', () => { slideIdx = (slideIdx - 1 + sli
 $('#slideNext').addEventListener('click', () => { slideIdx = (slideIdx + 1) % slideList.length; renderSlide(); });
 document.addEventListener('keydown', (e) => { if (!$('#slideshow').classList.contains('open')) return; if (e.key === 'ArrowRight') $('#slideNext').click(); if (e.key === 'ArrowLeft') $('#slidePrev').click(); });
 $('#fab').addEventListener('click', () => openComposer());
-$('#avatarBtn').addEventListener('click', () => {
-  const v = prompt('게시물에 표시할 이름', me.name || ''); if (v === null) return;
-  me.name = v.trim() || '익명'; saveMe(); toast(`이름: ${me.name}`);
+$('#avatarBtn').addEventListener('click', (e) => {
+  const setName = () => { const v = prompt('게시물에 표시할 이름', me.name || ''); if (v === null) return; me.name = v.trim() || '익명'; saveMe(); toast(`이름: ${me.name}`); };
+  const setPin = async () => {
+    const a = prompt('관리자 PIN을 정하세요 (4자리 이상, 참가자에게 알려주지 마세요)'); if (a === null) return;
+    if (a.trim().length < 4) return toast('4자리 이상으로 정해주세요');
+    if (prompt('한 번 더 입력하세요') !== a) return toast('PIN이 서로 달라요');
+    const h = await pinHash(a.trim()); state.adminHash = h; me.admin[BOARD_ID] = h; saveMe(); persist(); render();
+    toast('관리자 PIN을 설정했어요 — 이제 참가자는 보드 설정을 바꿀 수 없어요');
+  };
+  const login = async () => {
+    const a = prompt('관리자 PIN'); if (a === null) return;
+    const h = await pinHash(a.trim()); if (h !== state.adminHash) return toast('PIN이 맞지 않아요');
+    me.admin[BOARD_ID] = h; saveMe(); render(); toast('관리자 모드');
+  };
+  const logout = () => { delete me.admin[BOARD_ID]; saveMe(); render(); toast('참가자 화면으로 전환했어요'); };
+  openMenu(e, [
+    { label: `이름 바꾸기 (지금: ${me.name || '익명'})`, action: setName }, '-',
+    ...(!state.adminHash ? [{ label: '🔒 관리자 PIN 설정 (공유 전 필수)', action: setPin }]
+      : isAdmin() ? [{ label: '관리자 PIN 변경', action: setPin }, { label: '관리자 모드 끄기 (참가자 화면 보기)', action: logout }]
+      : [{ label: '🔑 관리자 로그인', action: login }]),
+  ]);
 });
 
 /* ---------------- 시작 ---------------- */
@@ -1574,7 +1716,7 @@ function setStatus(kind, text) {
     try {
       saved = await store.init((remote) => {
         if (!remote) return;
-        state = migrate(remote); store.remember(state); safeRender();
+        state = migrate(remote); store.remember(state); safeRender(); backupSoon();
       });
       setStatus('live', '● 실시간');
     } catch (e) {
@@ -1589,7 +1731,8 @@ function setStatus(kind, text) {
   }
   if (saved) { state = migrate(saved); store.remember(state); }
   else if (store.realtime) { state.id = BOARD_ID; await persist(); }   // 보드 문서 생성
-  render();
+  render(); fitBoardTop(); backupSoon();
+  if (store.realtime && !state.adminHash) setTimeout(() => toast('공유 전에 오른쪽 위 🐯 → 관리자 PIN을 설정하세요'), 1500);
   setInterval(renderMeta, 30000);
 })();
 </script>
