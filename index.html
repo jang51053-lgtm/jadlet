@@ -93,6 +93,17 @@
   .post-body { padding: 12px 14px; }
   .post-title { font-weight: 800; font-size: 16px; margin-bottom: 4px; word-break: break-word; }
   .post-text { font-size: 14px; line-height: 1.5; color: var(--card-text); opacity: .85; white-space: pre-wrap; word-break: break-word; }
+  .txt-link { color: #1d6fd6; text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
+  .txt-link:hover { color: #0b4fa8; }
+  :root.dark .txt-link { color: #8cc4ff; }
+  /* 카드 안 링크·이미지를 잡아도 링크가 아니라 카드 전체가 끌리도록 */
+  .post[draggable="true"] a, .post[draggable="true"] img { -webkit-user-drag: none; user-drag: none; }
+  .att-link:hover { border-color: rgba(0,0,0,.2); filter: brightness(.97); }
+  /* 드래그 중: 빈 섹션도 넉넉한 놓기 영역 + 위치 표시 */
+  body.dragging-post .posts { min-height: 90px; border-radius: 10px; }
+  body.dragging-post .posts:empty { outline: 2px dashed rgba(255,255,255,.3); outline-offset: 2px; }
+  .posts.drop-end { outline: 2px dashed rgba(255,232,61,.8) !important; outline-offset: 6px; }
+  .post.drop-before { box-shadow: 0 -5px 0 var(--yellow), var(--shadow) !important; }
   .post-footer { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px 10px 14px; font-size: 12px; color: var(--card-dim); }
   .post-actions { display: flex; gap: 2px; flex-wrap: wrap; justify-content: flex-end; }
   .post-actions button { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 14px; font-size: 12px; color: var(--card-dim); }
@@ -576,11 +587,8 @@ const me = (() => { try { return JSON.parse(localStorage.getItem('jadlet-me')) |
 me.flags ||= {};
 const saveMe = () => { try { localStorage.setItem('jadlet-me', JSON.stringify(me)); } catch {} };
 const myFlag = (id) => (me.flags[id] ||= {});
-function ensureName() {
-  if (me.name) return me.name;
-  const v = (prompt('게시물에 표시할 이름을 입력하세요 (비우면 익명)') || '').trim();
-  me.name = v || '익명'; saveMe(); return me.name;
-}
+/* 이름은 묻지 않음 — 필요하면 오른쪽 위 아바타(🐯)를 눌러 설정 */
+function ensureName() { return me.name || '익명'; }
 
 /* ---------------- 상수 ---------------- */
 const POST_COLORS = [
@@ -628,7 +636,7 @@ function isTypingInBoard() {
   const a = document.activeElement;
   return a && $('#boardInner').contains(a) && (a.tagName === 'INPUT' || a.isContentEditable);
 }
-function safeRender() { if (isTypingInBoard()) pendingRender = true; else render(); }
+function safeRender() { if (isTypingInBoard() || dragId) pendingRender = true; else render(); }
 document.addEventListener('focusout', () => { if (pendingRender && !isTypingInBoard()) setTimeout(() => { if (pendingRender) { pendingRender = false; render(); } }, 50); });
 
 /* ---------------- 유틸 ---------------- */
@@ -646,6 +654,16 @@ function darken(hex, amt = 0.15) {
 }
 function fmtSize(b) { return b > 1048576 ? (b / 1048576).toFixed(1) + 'MB' : Math.round(b / 1024) + 'KB'; }
 const readFile = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
+/* 텍스트 속 URL을 클릭 가능한 링크로 (esc 후 처리) */
+const URL_RE = /(https?:\/\/[^\s<>"']+|www\.[^\s<>"']+)/gi;
+function linkify(s) {
+  return esc(s).replace(URL_RE, (m) => {
+    const trail = (m.match(/[.,)!?;:]+$/) || [''])[0], u = trail ? m.slice(0, -trail.length) : m;
+    const href = /^https?:/i.test(u) ? u : 'https://' + u;
+    return `<a class="txt-link" href="${href}" target="_blank" rel="noopener">${u}</a>${trail}`;
+  });
+}
+const firstUrl = (s) => { const m = String(s || '').match(URL_RE); return m ? m[0].replace(/[.,)!?;:]+$/, '') : null; };
 function hostOf(url) { try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; } }
 function normalizeUrl(s) { s = s.trim(); if (!s) return null; if (!/^https?:\/\//i.test(s)) s = 'https://' + s; try { new URL(s); return s; } catch { return null; } }
 function looksLikeUrl(s) { return /^(https?:\/\/|www\.)|^[\w-]+(\.[\w-]+)+(\/\S*)?$/i.test(s.trim()); }
@@ -761,10 +779,21 @@ function renderColumns(inner) {
     nameEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); nameEl.blur(); } });
     el.querySelector('.section-menu').addEventListener('click', (e) => openSectionMenu(e, sec.id));
     el.querySelector('.section-add').addEventListener('click', () => openComposer({ sectionId: sec.id }));
-    [postsEl, el.querySelector('.section-head')].forEach((zone) => {
-      zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('over'); });
-      zone.addEventListener('dragleave', () => zone.classList.remove('over'));
-      zone.addEventListener('drop', (e) => { e.preventDefault(); zone.classList.remove('over'); const id = e.dataTransfer.getData('text/plain'); if (id) movePost(id, sec.id, null); });
+    /* 섹션 전체(머리·+버튼·빈 공간 포함)가 놓기 영역. 마우스 높이로 끼울 위치 계산 */
+    el.addEventListener('dragover', (e) => {
+      if (!dragId) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      const before = dropTarget(postsEl, e.clientY);
+      clearDropMarks();
+      if (before) before.classList.add('drop-before'); else postsEl.classList.add('drop-end');
+    });
+    el.addEventListener('drop', (e) => {
+      if (!dragId) return;
+      e.preventDefault();
+      const before = dropTarget(postsEl, e.clientY), id = dragId;
+      const beforeId = before ? before.dataset.id : null;
+      endDrag();
+      setTimeout(() => movePost(id, sec.id, beforeId), 0); // dragend가 원래 카드에서 먼저 끝나도록 렌더를 한 박자 늦춤
     });
     wrap.appendChild(el);
   });
@@ -795,7 +824,7 @@ function renderAttachment(a, opts = {}) {
     case 'video': return `<div class="att"><video src="${a.src}" controls playsinline></video></div>`;
     case 'audio': return `<div class="att"><audio src="${a.src}" controls></audio></div>`;
     case 'file': return `<div class="att"><a class="att-file" href="${a.src}" download="${esc(a.name)}"><div class="ic">${I.file}</div><div class="u"><b>${esc(a.name)}</b><span>${fmtSize(a.size)}</span></div></a></div>`;
-    case 'link': return `<div class="att"><a class="att-link" href="${esc(a.url)}" target="_blank" rel="noopener"><img src="https://www.google.com/s2/favicons?domain=${esc(hostOf(a.url))}&sz=64" alt=""><div class="u"><b>${esc(hostOf(a.url))}</b><span>${esc(a.url)}</span></div></a></div>`;
+    case 'link': return `<div class="att"><a class="att-link" href="${esc(a.url)}" target="_blank" rel="noopener"><img src="https://www.google.com/s2/favicons?domain=${esc(hostOf(a.url))}&sz=64" alt="" draggable="false"><div class="u"><b>${esc(hostOf(a.url))}</b><span>${esc(a.url)}</span></div></a></div>`;
     case 'youtube': return `<div class="att att-embed yt" data-yt="${a.id}"><img src="https://img.youtube.com/vi/${a.id}/hqdefault.jpg" alt="" draggable="false"><button class="yt-play" title="재생">${I.youtube}</button></div>
         <div class="att-caption"><a href="${esc(a.url)}" target="_blank" rel="noopener">YouTube에서 열기 ↗</a></div>`;
     case 'spotify': return `<div class="att att-spotify"><iframe src="https://open.spotify.com/embed/${a.path}" allow="encrypted-media" loading="lazy"></iframe></div>`;
@@ -835,7 +864,7 @@ function renderPost(p) {
   el.innerHTML = `
     ${p.approved === false ? `<div class="pending-bar">승인 대기 중<button class="approve">승인</button><button class="rej">거절</button></div>` : ''}
     ${renderAttachment(p.attachment, { postId: p.id })}
-    ${p.title || p.body ? `<div class="post-body">${p.title ? `<div class="post-title">${esc(p.title)}</div>` : ''}${p.body ? `<div class="post-text">${esc(p.body)}</div>` : ''}</div>` : '<div style="height:8px"></div>'}
+    ${p.title || p.body ? `<div class="post-body">${p.title ? `<div class="post-title">${linkify(p.title)}</div>` : ''}${p.body ? `<div class="post-text">${linkify(p.body)}</div>` : ''}</div>` : '<div style="height:8px"></div>'}
     <div class="post-footer">
       <span>${s.showAuthor ? `${esc(p.author || '익명')} • ${timeAgo(p.createdAt)}` : ''}</span>
       <div class="post-actions">
@@ -885,13 +914,35 @@ function renderPost(p) {
   on('.post-menu-btn', 'click', (e) => openPostMenu(e, p.id));
 
   if (manual) {
-    el.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', p.id); e.dataTransfer.effectAllowed = 'move'; setTimeout(() => el.classList.add('dragging'), 0); });
-    el.addEventListener('dragend', () => el.classList.remove('dragging'));
-    el.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); el.classList.add('drop-before'); });
-    el.addEventListener('dragleave', () => el.classList.remove('drop-before'));
-    el.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); el.classList.remove('drop-before'); const id = e.dataTransfer.getData('text/plain'); if (id && id !== p.id) movePost(id, p.sectionId, p.id); });
+    el.addEventListener('dragstart', (e) => {
+      if (e.target.closest('input, textarea, [contenteditable="true"]')) return e.preventDefault();
+      dragId = p.id;
+      e.dataTransfer.setData('text/plain', p.id); e.dataTransfer.effectAllowed = 'move';
+      setTimeout(() => { el.classList.add('dragging'); document.body.classList.add('dragging-post'); }, 0);
+    });
+    el.addEventListener('dragend', endDrag);
+    if (state.settings.layout !== 'column') { // 담벼락/그리드/스트림: 카드 위에 놓으면 그 앞으로
+      el.addEventListener('dragover', (e) => { if (!dragId || dragId === p.id) return; e.preventDefault(); clearDropMarks(); el.classList.add('drop-before'); });
+      el.addEventListener('drop', (e) => { if (!dragId) return; e.preventDefault(); const id = dragId; endDrag(); if (id !== p.id) setTimeout(() => movePost(id, p.sectionId, p.id), 0); });
+    }
   }
   return el;
+}
+
+/* ---------------- 드래그 앤 드롭 ---------------- */
+let dragId = null;
+function clearDropMarks() { document.querySelectorAll('.drop-before, .drop-end').forEach((n) => n.classList.remove('drop-before', 'drop-end')); }
+function endDrag() {
+  dragId = null; clearDropMarks(); document.body.classList.remove('dragging-post');
+  document.querySelectorAll('.post.dragging').forEach((n) => n.classList.remove('dragging'));
+  if (pendingRender) { pendingRender = false; render(); } // 드래그 중 미뤄둔 실시간 변경 반영
+}
+/* 마우스 y보다 아래에 중심이 있는 첫 카드 = 그 앞에 끼움 (없으면 맨 끝) */
+function dropTarget(postsEl, y) {
+  return [...postsEl.querySelectorAll(':scope > .post')].find((n) => {
+    if (n.dataset.id === dragId) return false;
+    const r = n.getBoundingClientRect(); return y < r.top + r.height / 2;
+  }) || null;
 }
 
 /* ---------------- 조작 ---------------- */
@@ -1028,11 +1079,21 @@ $('#colorPick').addEventListener('click', (e) => openMenu(e, POST_COLORS.map((c)
 $('#sectionPick').addEventListener('click', (e) => openMenu(e, state.sections.map((s) => ({ label: s.name, action: () => { selectedSection = s.id; updateComposerUI(); } }))));
 
 async function submitPost() {
-  const title = $('#postTitle').value.trim(), body = $('#postBody').value.trim();
+  const title = $('#postTitle').value.trim();
+  let body = $('#postBody').value.trim();
   if (!title && !body && !attachment) return toast('내용을 입력해주세요');
   const btn = $('#composerSubmit');
   if (btn.disabled) return;
   const author = ensureName();
+  // 첨부 없이 본문/제목에 URL만 적었으면 자동으로 링크 카드(YouTube·Spotify는 플레이어) 붙이기
+  if (!attachment) {
+    const raw = firstUrl(body) || firstUrl(title), url = raw && normalizeUrl(raw);
+    if (url) {
+      const yt = youtubeId(url), sp = spotifyPath(url);
+      attachment = yt ? { type: 'youtube', id: yt, url } : sp ? { type: 'spotify', path: sp, url } : { type: 'link', url };
+      if (body === raw) body = ''; // 본문이 링크뿐이면 카드와 중복되지 않게 비움
+    }
+  }
   // data: URL 첨부는 저장소에 올리고 URL로 바꿈 (Storage → 압축 인라인 순)
   if (attachment?.src?.startsWith('data:')) {
     btn.disabled = true; btn.textContent = '업로드 중...';
@@ -1482,7 +1543,7 @@ function closeSlideshow() { $('#slideshow').classList.remove('open'); $('#slide'
 function renderSlide() {
   const p = slideList[slideIdx];
   $('#slide').style.background = state.settings.scheme === 'dark' ? '' : (p.color || '#fff');
-  $('#slide').innerHTML = `${renderAttachment(p.attachment)}<div class="slide-body">${p.title ? `<div class="slide-title">${esc(p.title)}</div>` : ''}${p.body ? `<div class="slide-text">${esc(p.body)}</div>` : ''}</div>`;
+  $('#slide').innerHTML = `${renderAttachment(p.attachment)}<div class="slide-body">${p.title ? `<div class="slide-title">${linkify(p.title)}</div>` : ''}${p.body ? `<div class="slide-text">${linkify(p.body)}</div>` : ''}</div>`;
   $('#slideCounter').textContent = `${slideIdx + 1} / ${slideList.length}`;
 }
 $('#slideshowBtn').addEventListener('click', openSlideshow);
