@@ -77,6 +77,13 @@
   .posts.over { outline: 2px dashed rgba(255,255,255,.35); outline-offset: 6px; border-radius: 8px; }
   .new-section { white-space: nowrap; background: var(--chip); border-radius: 18px; height: 36px; padding: 0 14px; font-weight: 700; font-size: 14px; flex: none; margin-top: 5px; }
   .new-section:hover { background: var(--chip-hover); }
+  /* 섹션이 많아져도 '섹션 추가'가 화면 오른쪽에 항상 보이도록 고정 + 가로 스크롤바 항상 표시 */
+  .sections > .new-section { position: sticky; right: 4px; z-index: 5; box-shadow: 0 2px 10px rgba(0,0,0,.35); }
+  .board { scrollbar-width: auto; scrollbar-color: rgba(128,128,128,.7) transparent; cursor: default; }
+  .board::-webkit-scrollbar { width: 12px; height: 12px; }
+  .board::-webkit-scrollbar-thumb { background: rgba(128,128,128,.6); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  .board::-webkit-scrollbar-thumb:hover { background: rgba(128,128,128,.85); background-clip: padding-box; }
+  .board.panning { cursor: grabbing; user-select: none; }
   /* 다른 레이아웃 */
   .flow { margin: 0 auto; }
   .flow.layout-wall { columns: var(--pw); column-gap: 16px; max-width: 1400px; }
@@ -858,6 +865,32 @@ function sortedPosts(list) {
     s === 'newest' ? b.createdAt - a.createdAt : s === 'oldest' ? a.createdAt - b.createdAt : s === 'likes' ? score(b) - score(a) : a.order - b.order);
 }
 const matches = (p) => { const q = searchQuery.trim().toLowerCase(); return !q || (p.title + ' ' + p.body).toLowerCase().includes(q); };
+
+/* 보드 빈 곳을 잡고 끌어서 가로·세로 이동 + 휠로 가로 이동 (섹션이 많을 때) */
+(function setupBoardPan() {
+  const board = document.getElementById('board'); if (!board) return;
+  let pan = null;
+  const isBlank = (t) => !t.closest('.card, .post, button, a, input, textarea, select, video, audio, iframe, [contenteditable], .section-head, .menu, .att');
+  board.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || e.pointerType === 'touch' || !isBlank(e.target)) return;
+    pan = { x: e.clientX, y: e.clientY, l: board.scrollLeft, t: board.scrollTop, moved: false };
+  });
+  window.addEventListener('pointermove', (e) => {
+    if (!pan) return;
+    const dx = e.clientX - pan.x, dy = e.clientY - pan.y;
+    if (!pan.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+    pan.moved = true; board.classList.add('panning');
+    board.scrollLeft = pan.l - dx; board.scrollTop = pan.t - dy;
+  });
+  const end = () => { if (pan) { pan = null; board.classList.remove('panning'); } };
+  window.addEventListener('pointerup', end); window.addEventListener('pointercancel', end);
+  board.addEventListener('wheel', (e) => {
+    if (e.ctrlKey || e.deltaX) return;
+    const canH = board.scrollWidth > board.clientWidth + 1;
+    const canV = board.scrollHeight > board.clientHeight + 1;
+    if (canH && (e.shiftKey || !canV) && Math.abs(e.deltaY) > 0) { board.scrollLeft += e.deltaY; e.preventDefault(); }
+  }, { passive: false });
+})();
 
 function render() {
   applyDesign();
